@@ -1,0 +1,460 @@
+name: Flutter Build
+run-name: build-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job ID dari bot
+        required: true
+        type: string
+      tag:
+        description: Tag release yang berisi input.zip
+        required: true
+        type: string
+      target:
+        description: apk atau web
+        required: true
+        type: string
+        default: apk
+      mode:
+        description: release atau debug (web selalu release)
+        required: true
+        type: string
+        default: release
+      flutter_version:
+        description: auto, stable, atau versi (contoh 3.35.7 / 3.32.x)
+        required: false
+        type: string
+        default: auto
+      site_url:
+        description: (Web2APK) link website
+        required: false
+        type: string
+        default: ''
+      app_name:
+        description: (Web2APK) nama aplikasi
+        required: false
+        type: string
+        default: ''
+      has_icon:
+        description: (Web2APK) true jika ada ikon (icon.bin di release)
+        required: false
+        type: string
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      TARGET: ${{ inputs.target }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download source
+        if: inputs.target != 'web2apk'
+        run: |
+          set -e
+          mkdir -p work/src
+          gh release download "$TAG" -p input.zip -D work -R "$GITHUB_REPOSITORY"
+          unzip -q work/input.zip -d work/src || [ $? -eq 1 ]
+
+      - name: Locate project
+        if: inputs.target != 'web2apk'
+        run: |
+          PUB=$(find work/src -name pubspec.yaml \
+            -not -path '*__MACOSX*' -not -path '*/.*' \
+            -not -path '*/ios/*' -not -path '*/android/*' -not -path '*/example/*' \
+            | awk '{print length"\t"$0}' | sort -n | cut -f2- \
+            | while IFS= read -r f; do if grep -q 'sdk: *flutter' "$f"; then echo "$f"; break; fi; done)
+          if [ -z "$PUB" ]; then
+            echo "ERROR: pubspec.yaml project Flutter tidak ditemukan di dalam ZIP"
+            exit 1
+          fi
+          echo "Project: $PUB"
+          echo "PROJECT_DIR=$(dirname "$PUB")" >> "$GITHUB_ENV"
+
+      - name: Detect Flutter version
+        env:
+          REQ_VERSION: ${{ inputs.flutter_version }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, re
+
+          proj = os.environ.get("PROJECT_DIR", "")
+          req = (os.environ.get("REQ_VERSION") or "auto").strip().lower()
+          if os.environ.get("TARGET") == "web2apk" and req in ("auto", ""):
+              req = "stable"  # template Web2APK dibuat bot, tidak perlu menebak versi
+
+          # Versi Dart (batas bawah di pubspec) -> versi Flutter yang dulu merilisnya
+          DART_TO_FLUTTER = {
+              (3, 0): "3.10.6", (3, 1): "3.13.9", (3, 2): "3.16.9", (3, 3): "3.19.6",
+              (3, 4): "3.22.3", (3, 5): "3.24.5", (3, 6): "3.27.4", (3, 7): "3.29.3",
+              (3, 8): "3.32.8", (3, 9): "3.35.7", (3, 10): "3.38.x", (3, 11): "3.41.x",
+          }
+
+          def read(path):
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      return fh.read()
+              except Exception:
+                  return ""
+
+          def valid(v):
+              return bool(re.fullmatch(r"\d+\.\d+\.(\d+|x)", v))
+
+          chosen, why = "", "stable terbaru"
+          if req not in ("auto", ""):
+              if req == "stable":
+                  why = "manual: stable terbaru"
+              elif valid(req):
+                  chosen, why = req, "manual (setting bot)"
+              else:
+                  print("Versi manual tidak valid (" + req + "), pakai auto")
+                  req = "auto"
+
+          if req == "auto":
+              found = ""
+              m = re.search(r'"flutter"\s*:\s*"(\d+\.\d+\.\d+)', read(os.path.join(proj, ".fvmrc")))
+              if m:
+                  found, why = m.group(1), "file .fvmrc"
+              if not found:
+                  m = re.search(r'"flutterSdkVersion"\s*:\s*"(\d+\.\d+\.\d+)', read(os.path.join(proj, ".fvm", "fvm_config.json")))
+                  if m:
+                      found, why = m.group(1), "file .fvm/fvm_config.json"
+              if not found:
+                  pub = read(os.path.join(proj, "pubspec.yaml"))
+                  env = re.search(r"^environment:[ \t]*\n((?:[ \t]+.*\n?|[ \t]*\n)+)", pub, re.M)
+                  block = env.group(1) if env else ""
+                  m = re.search(r"^[ \t]+flutter:[ \t]*[\"']?(\d+\.\d+\.\d+)[\"']?[ \t]*$", block, re.M)
+                  if m:
+                      found, why = m.group(1), "pubspec environment.flutter"
+                  else:
+                      # hanya gaya "sdk: ^3.9.2" (hasil flutter create) yang dipercaya
+                      m = re.search(r"^[ \t]+sdk:[ \t]*[\"']?\^(\d+)\.(\d+)", block, re.M)
+                      if m:
+                          key = (int(m.group(1)), int(m.group(2)))
+                          found = "3.7.12" if key[0] == 2 else DART_TO_FLUTTER.get(key, "")
+                          why = "Dart SDK ^%d.%d di pubspec.yaml" % key
+                      else:
+                          why = "tidak ada info versi di project (sdk berupa rentang)"
+              chosen = found
+
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write("FLUTTER_VERSION=" + chosen + "\n")
+          print("==> Flutter dipakai: " + (chosen or "stable terbaru") + "  (" + why + ")")
+          PYEOF
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Generate Web2APK project
+        if: inputs.target == 'web2apk'
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          APP_NAME: ${{ inputs.app_name }}
+          JOB_ID: ${{ inputs.job_id }}
+          HAS_ICON: ${{ inputs.has_icon }}
+        run: |
+          set -e
+          mkdir -p work/src
+          cd work/src
+          echo "==> flutter create (Web2APK)"
+          flutter create --org com.web2apk --project-name "app_${JOB_ID}" --platforms=android --no-pub app
+          cd app
+          echo "==> tambah dependency webview_flutter + url_launcher"
+          flutter pub add webview_flutter url_launcher
+          python3 - <<'PYEOF'
+          import os, re, sys
+
+          url = os.environ["SITE_URL"].strip()
+          name = re.sub(r"[\x00-\x1f]", "", os.environ["APP_NAME"]).strip()[:40] or "WebApp"
+
+          if len(url) > 500 or not re.fullmatch(r"https?://[^\s\"\\<>]+", url):
+              print("ERROR: URL tidak valid: " + url)
+              sys.exit(1)
+
+          def dq(s):
+              # aman untuk string Dart berkutip dua
+              return s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+
+          def xml_attr(s):
+              return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+          MAIN = r'''
+          import "package:flutter/material.dart";
+          import "package:url_launcher/url_launcher.dart";
+          import "package:webview_flutter/webview_flutter.dart";
+
+          const String kStartUrl = "__URL__";
+          const String kAppName = "__NAME__";
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const WebApp());
+          }
+
+          class WebApp extends StatelessWidget {
+            const WebApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kAppName,
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+                home: const WebPage(),
+              );
+            }
+          }
+
+          class WebPage extends StatefulWidget {
+            const WebPage({super.key});
+
+            @override
+            State<WebPage> createState() => _WebPageState();
+          }
+
+          class _WebPageState extends State<WebPage> {
+            late final WebViewController _controller;
+            int _progress = 0;
+            bool _hasError = false;
+            bool _canGoBack = false;
+
+            Future<void> _syncBack() async {
+              final bool back = await _controller.canGoBack();
+              if (mounted) setState(() => _canGoBack = back);
+            }
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onProgress: (int progress) {
+                      if (mounted) setState(() => _progress = progress);
+                    },
+                    onPageStarted: (String url) {
+                      if (mounted) setState(() => _hasError = false);
+                    },
+                    onPageFinished: (String url) {
+                      _syncBack();
+                    },
+                    onUrlChange: (UrlChange change) {
+                      _syncBack();
+                    },
+                    onWebResourceError: (WebResourceError error) {
+                      if (error.isForMainFrame != false && mounted) {
+                        setState(() => _hasError = true);
+                      }
+                    },
+                    onNavigationRequest: (NavigationRequest request) async {
+                      final Uri? uri = Uri.tryParse(request.url);
+                      if (uri == null) return NavigationDecision.navigate;
+                      const List<String> inApp = ["http", "https", "about", "data", "blob", "file", "javascript"];
+                      if (inApp.contains(uri.scheme)) return NavigationDecision.navigate;
+                      try {
+                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                      } catch (_) {}
+                      return NavigationDecision.prevent;
+                    },
+                  ),
+                )
+                ..loadRequest(Uri.parse(kStartUrl));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: !_canGoBack,
+                onPopInvokedWithResult: (bool didPop, Object? result) async {
+                  if (didPop) return;
+                  if (await _controller.canGoBack()) {
+                    await _controller.goBack();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(
+                      children: [
+                        WebViewWidget(controller: _controller),
+                        if (_progress < 100 && !_hasError)
+                          LinearProgressIndicator(value: _progress / 100.0),
+                        if (_hasError)
+                          Container(
+                            color: Theme.of(context).scaffoldBackgroundColor,
+                            width: double.infinity,
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Icon(Icons.wifi_off_rounded, size: 72),
+                                const SizedBox(height: 16),
+                                const Text("Tidak dapat memuat halaman", style: TextStyle(fontSize: 18)),
+                                const SizedBox(height: 8),
+                                const Text("Periksa koneksi internet kamu"),
+                                const SizedBox(height: 24),
+                                FilledButton.icon(
+                                  onPressed: () {
+                                    setState(() => _hasError = false);
+                                    _controller.reload();
+                                  },
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text("Coba lagi"),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          '''
+
+          with open("lib/main.dart", "w", encoding="utf-8") as fh:
+              fh.write(MAIN.replace("__URL__", dq(url)).replace("__NAME__", dq(name)))
+
+          mf = "android/app/src/main/AndroidManifest.xml"
+          with open(mf, encoding="utf-8") as fh:
+              x = fh.read()
+          x = re.sub(r'android:label="[^"]*"', lambda m: 'android:label="' + xml_attr(name) + '"', x, count=1)
+          if "android.permission.INTERNET" not in x:
+              x = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + '\n    <uses-permission android:name="android.permission.INTERNET"/>', x, count=1)
+          if "usesCleartextTraffic" not in x:
+              x = x.replace("<application", '<application\n        android:usesCleartextTraffic="true"', 1)
+          with open(mf, "w", encoding="utf-8") as fh:
+              fh.write(x)
+
+          print("==> Web2APK: " + name + " -> " + url)
+          PYEOF
+
+          if [ "$HAS_ICON" = "true" ]; then
+            echo "==> memasang ikon kustom"
+            (
+              set +e
+              gh release download "$TAG" -p icon.bin -D "$RUNNER_TEMP" -R "$GITHUB_REPOSITORY"
+              mkdir -p assets
+              convert "$RUNNER_TEMP/icon.bin[0]" -resize 1024x1024^ -gravity center -extent 1024x1024 assets/icon.png \
+                || cp "$RUNNER_TEMP/icon.bin" assets/icon.png
+              flutter pub add dev:flutter_launcher_icons
+              printf '\nflutter_launcher_icons:\n  android: true\n  ios: false\n  image_path: "assets/icon.png"\n' >> pubspec.yaml
+              dart run flutter_launcher_icons
+            ) || echo "WARNING: ikon kustom gagal, memakai ikon default"
+          fi
+
+          echo "PROJECT_DIR=work/src/app" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          {
+            set -e
+            echo "==> flutter version"
+            flutter --version -v
+            echo "==> flutter doctor"
+            flutter doctor -v || true
+
+            NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}')
+            if [ "$TARGET" = "web" ]; then PLATFORM=web; else PLATFORM=android; fi
+            if [ ! -d "$PLATFORM" ]; then
+              echo "==> folder $PLATFORM tidak ada, generate otomatis"
+              flutter create --platforms="$PLATFORM" --project-name "$NAME" .
+            fi
+
+            # Auto-upgrade Gradle wrapper jika lebih rendah dari minimum Flutter
+            GW=android/gradle/wrapper/gradle-wrapper.properties
+            GRADLE_MIN="8.14"
+            if [ -f "$GW" ]; then
+              CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)+' "$GW" | head -1 | sed 's/gradle-//')
+              echo "==> Gradle wrapper project: ${CUR:-tidak terdeteksi} (minimum $GRADLE_MIN)"
+              if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$GRADLE_MIN" "$CUR" | sort -V | head -1)" != "$GRADLE_MIN" ]; then
+                echo "==> Upgrade Gradle wrapper ke $GRADLE_MIN"
+                sed -i -E "s#gradle-[0-9.]+-(all|bin)\.zip#gradle-$GRADLE_MIN-\1.zip#" "$GW"
+                grep distributionUrl "$GW"
+              fi
+            fi
+
+            # Auto-upgrade Android Gradle Plugin (AGP) jika lebih rendah dari minimum Flutter
+            AGP_MIN="8.11.1"
+            python3 - "$AGP_MIN" <<'PYEOF'
+          import re, sys, os
+          NEW = sys.argv[1]
+          MIN = tuple(int(x) for x in NEW.split('.'))
+          def too_low(v):
+              return tuple(int(x) for x in v.split('.')[:3]) < MIN
+          pats = [
+              re.compile(r"""(id\s*\(?\s*["']com\.android\.(?:application|library)["']\s*\)?\s*version\s*\(?\s*["'])([0-9.]+)(["'])"""),
+              re.compile(r"""(com\.android\.tools\.build:gradle:)([0-9.]+)()"""),
+          ]
+          for f in ["android/settings.gradle", "android/settings.gradle.kts", "android/build.gradle", "android/build.gradle.kts"]:
+              if not os.path.isfile(f):
+                  continue
+              text = open(f, encoding="utf-8").read()
+              orig = text
+              for pat in pats:
+                  def rep(m, f=f):
+                      if too_low(m.group(2)):
+                          print("==> " + f + ": AGP " + m.group(2) + " -> " + NEW)
+                          return m.group(1) + NEW + m.group(3)
+                      return m.group(0)
+                  text = pat.sub(rep, text)
+              if text != orig:
+                  open(f, "w", encoding="utf-8").write(text)
+          PYEOF
+
+            echo "==> flutter pub get"
+            flutter pub get
+
+            if [ "$TARGET" = "web" ]; then
+              echo "==> build web (release)"
+              flutter build web --release --no-tree-shake-icons -v
+              (cd build/web && zip -qr "$GITHUB_WORKSPACE/output.zip" .)
+            else
+              echo "==> build apk ($MODE)"
+              if [ "$MODE" = "debug" ]; then APK_FLAGS="--debug"; else APK_FLAGS="--release --no-tree-shake-icons"; fi
+              if ! flutter build apk $APK_FLAGS -v 2>&1 | tee /tmp/apk_try1.log; then
+                if grep -q "android-skip-build-dependency-validation" /tmp/apk_try1.log; then
+                  echo "==> RETRY: bypass validasi versi dependency Android (AGP/Kotlin)"
+                  flutter build apk $APK_FLAGS --android-skip-build-dependency-validation -v
+                else
+                  exit 1
+                fi
+              fi
+              cp "build/app/outputs/flutter-apk/app-$MODE.apk" "$GITHUB_WORKSPACE/output.apk"
+            fi
+            echo "==> BUILD SELESAI"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Upload result
+        if: success()
+        run: |
+          if [ "$TARGET" = "web" ]; then F=output.zip; else F=output.apk; fi
+          gh release upload "$TAG" "$GITHUB_WORKSPACE/$F" --clobber -R "$GITHUB_REPOSITORY"
+
+      - name: Upload log
+        if: always()
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
+            gh release upload "$TAG" "$GITHUB_WORKSPACE/build.log" --clobber -R "$GITHUB_REPOSITORY" || true
+          fi
